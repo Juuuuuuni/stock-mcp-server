@@ -45,6 +45,13 @@ def get_stock_analysis(ticker: str, days: int = 120) -> str:
     df['BB_upper'] = bb.bollinger_hband()
     df['BB_lower'] = bb.bollinger_lband()
 
+    ichimoku = ta.trend.IchimokuIndicator(df['고가'], df['저가'], window1=9, window2=26, window3=52)
+    df['Ichimoku_conversion'] = ichimoku.ichimoku_conversion_line()
+    df['Ichimoku_base'] = ichimoku.ichimoku_base_line()
+    df['Ichimoku_span_a'] = ichimoku.ichimoku_a()
+    df['Ichimoku_span_b'] = ichimoku.ichimoku_b()
+    df['Ichimoku_lagging'] = df['종가'].shift(-26)
+
     # 최근 데이터 요약
     latest = df.iloc[-1]
     prev = df.iloc[-2]
@@ -68,6 +75,11 @@ def get_stock_analysis(ticker: str, days: int = 120) -> str:
             "MACD_histogram": round(latest['MACD_hist'], 2) if pd.notna(latest['MACD_hist']) else None,
             "볼린저_상단": round(latest['BB_upper'], 0) if pd.notna(latest['BB_upper']) else None,
             "볼린저_하단": round(latest['BB_lower'], 0) if pd.notna(latest['BB_lower']) else None,
+            "일목_전환선": round(latest['Ichimoku_conversion'], 0) if pd.notna(latest['Ichimoku_conversion']) else None,
+            "일목_기준선": round(latest['Ichimoku_base'], 0) if pd.notna(latest['Ichimoku_base']) else None,
+            "일목_선행스팬A": round(latest['Ichimoku_span_a'], 0) if pd.notna(latest['Ichimoku_span_a']) else None,
+            "일목_선행스팬B": round(latest['Ichimoku_span_b'], 0) if pd.notna(latest['Ichimoku_span_b']) else None,
+            "일목_후행스팬": round(latest['Ichimoku_lagging'], 0) if pd.notna(latest['Ichimoku_lagging']) else None,
         },
         "기간내_최고가": int(df['고가'].max()),
         "기간내_최저가": int(df['저가'].min()),
@@ -141,6 +153,13 @@ def get_us_stock_analysis(symbol: str, days: int = 120) -> str:
     df['BB_upper'] = bb.bollinger_hband()
     df['BB_lower'] = bb.bollinger_lband()
 
+    ichimoku = ta.trend.IchimokuIndicator(df['High'], df['Low'], window1=9, window2=26, window3=52)
+    df['Ichimoku_conversion'] = ichimoku.ichimoku_conversion_line()
+    df['Ichimoku_base'] = ichimoku.ichimoku_base_line()
+    df['Ichimoku_span_a'] = ichimoku.ichimoku_a()
+    df['Ichimoku_span_b'] = ichimoku.ichimoku_b()
+    df['Ichimoku_lagging'] = df['Close'].shift(-26)
+
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -161,6 +180,11 @@ def get_us_stock_analysis(symbol: str, days: int = 120) -> str:
             "MACD_histogram": round(latest['MACD_hist'], 2) if pd.notna(latest['MACD_hist']) else None,
             "볼린저_상단": round(latest['BB_upper'], 2) if pd.notna(latest['BB_upper']) else None,
             "볼린저_하단": round(latest['BB_lower'], 2) if pd.notna(latest['BB_lower']) else None,
+            "일목_전환선": round(latest['Ichimoku_conversion'], 2) if pd.notna(latest['Ichimoku_conversion']) else None,
+            "일목_기준선": round(latest['Ichimoku_base'], 2) if pd.notna(latest['Ichimoku_base']) else None,
+            "일목_선행스팬A": round(latest['Ichimoku_span_a'], 2) if pd.notna(latest['Ichimoku_span_a']) else None,
+            "일목_선행스팬B": round(latest['Ichimoku_span_b'], 2) if pd.notna(latest['Ichimoku_span_b']) else None,
+            "일목_후행스팬": round(latest['Ichimoku_lagging'], 2) if pd.notna(latest['Ichimoku_lagging']) else None,
         },
         "기간내_최고가": round(df['High'].max(), 2),
         "기간내_최저가": round(df['Low'].min(), 2),
