@@ -254,6 +254,10 @@ def _calc_screening_indicators(df: pd.DataFrame, close='Close', high='High',
     df['BB_upper'] = df['BB_mid'] + 2 * df['BB_std']
     df['BB_lower'] = df['BB_mid'] - 2 * df['BB_std']
 
+    # 볼린저 밴드 폭 (%)  ← 신규: BB 스퀴즈 전략용
+    df['BB_width'] = ((df['BB_upper'] - df['BB_lower']) / df['BB_mid'] * 100)
+    df['BB_width_MA20'] = df['BB_width'].rolling(20).mean()
+
     # 거래량 이동평균
     df['Vol_MA5'] = df[volume].rolling(5).mean()
     df['Vol_MA20'] = df[volume].rolling(20).mean()
@@ -267,12 +271,42 @@ def _calc_screening_indicators(df: pd.DataFrame, close='Close', high='High',
         / df[close].rolling(5).mean() * 100
     )
 
+    # ── 신규 지표: 스토캐스틱 (%K, %D) ──
+    stoch_k_period = 14
+    stoch_d_period = 3
+    lowest_low = df[low].rolling(stoch_k_period).min()
+    highest_high = df[high].rolling(stoch_k_period).max()
+    denom = highest_high - lowest_low
+    df['Stoch_K'] = ((df[close] - lowest_low) / denom.replace(0, np.nan)) * 100
+    df['Stoch_D'] = df['Stoch_K'].rolling(stoch_d_period).mean()
+
+    # ── 신규 지표: 일목균형표 ──
+    hi9 = df[high].rolling(9).max()
+    lo9 = df[low].rolling(9).min()
+    df['Ichi_tenkan'] = (hi9 + lo9) / 2  # 전환선
+
+    hi26 = df[high].rolling(26).max()
+    lo26 = df[low].rolling(26).min()
+    df['Ichi_kijun'] = (hi26 + lo26) / 2  # 기준선
+
+    df['Ichi_spanA'] = ((df['Ichi_tenkan'] + df['Ichi_kijun']) / 2).shift(26)  # 선행스팬A
+    hi52 = df[high].rolling(52).max()
+    lo52 = df[low].rolling(52).min()
+    df['Ichi_spanB'] = ((hi52 + lo52) / 2).shift(26)  # 선행스팬B
+
     # 참조용 컬럼명 통일
     df['_close'] = df[close]
     df['_open'] = df[open_]
+    df['_high'] = df[high]
+    df['_low'] = df[low]
     df['_volume'] = df[volume]
 
     return df
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 기존 4개 전략
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
 def _check_golden_cross(df: pd.DataFrame) -> tuple:
@@ -348,11 +382,313 @@ def _check_volume_breakout(df: pd.DataFrame) -> tuple:
     return score >= 3, {'전략': '거래량 폭발', '점수': f'{score}/5', '조건': conds}
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 신규 6개 전략
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _check_rsi_divergence(df: pd.DataFrame) -> tuple:
+    """RSI 다이버전스 — 주가와 RSI의 방향 괴리를 포착합니다.
+
+    ■ 매수(강세) 다이버전스: 주가는 저점을 낮추는데 RSI는 저점을 높임 → 하락 피로, 반등 기대
+    ■ 매도(약세) 다이버전스: 주가는 고점을 높이는데 RSI는 고점을 낮춤 → 상승 피로, 조정 주의
+    최근 20일 내 두 개의 피벗(고점/저점)을 비교해 판단합니다.
+    """
+    if len(df) < 20:
+        return False, {}
+
+    window = df.iloc[-20:]
+    closes = window['_close'].values
+    rsi_vals = window['RSI'].values
+
+    if np.any(np.isnan(rsi_vals)):
+        return False, {}
+
+    # 간단한 피벗 탐색: 전반부([-20:-10])와 후반부([-10:]) 비교
+    first_half_close = closes[:10]
+    second_half_close = closes[10:]
+    first_half_rsi = rsi_vals[:10]
+    second_half_rsi = rsi_vals[10:]
+
+    today = df.iloc[-1]
+
+    # ── 매수(강세) 다이버전스 ──
+    fh_low_idx = np.argmin(first_half_close)
+    sh_low_idx = np.argmin(second_half_close)
+    price_lower_low = second_half_close[sh_low_idx] < first_half_close[fh_low_idx]
+    rsi_higher_low = second_half_rsi[sh_low_idx] > first_half_rsi[fh_low_idx]
+
+    bullish = price_lower_low and rsi_higher_low
+
+    # ── 매도(약세) 다이버전스 ──
+    fh_high_idx = np.argmax(first_half_close)
+    sh_high_idx = np.argmax(second_half_close)
+    price_higher_high = second_half_close[sh_high_idx] > first_half_close[fh_high_idx]
+    rsi_lower_high = second_half_rsi[sh_high_idx] < first_half_rsi[fh_high_idx]
+
+    bearish = price_higher_high and rsi_lower_high
+
+    conds = {
+        '주가 저점↓ + RSI 저점↑ (강세)': bool(bullish),
+        '주가 고점↑ + RSI 고점↓ (약세)': bool(bearish),
+        'RSI 과매수(>70) 영역': bool(today['RSI'] > 70),
+        'RSI 과매도(<30) 영역': bool(today['RSI'] < 30),
+    }
+    score = sum(conds.values())
+    detected = bullish or bearish
+    return detected, {'전략': 'RSI 다이버전스', '점수': f'{score}/4', '조건': conds}
+
+
+def _check_macd_divergence(df: pd.DataFrame) -> tuple:
+    """MACD 다이버전스 — 주가와 MACD의 방향 괴리를 포착합니다.
+
+    ■ 매수(강세) 다이버전스: 주가 저점 하락 + MACD 저점 상승 → 반등 신호
+    ■ 매도(약세) 다이버전스: 주가 고점 상승 + MACD 고점 하락 → 조정 신호
+    ■ 제로라인 상향 돌파: MACD가 0선을 아래→위로 돌파 → 추세 전환 확인
+    """
+    if len(df) < 20:
+        return False, {}
+
+    window = df.iloc[-20:]
+    closes = window['_close'].values
+    macd_vals = window['MACD'].values
+
+    if np.any(np.isnan(macd_vals)):
+        return False, {}
+
+    today = df.iloc[-1]
+    yesterday = df.iloc[-2]
+
+    first_half_close = closes[:10]
+    second_half_close = closes[10:]
+    first_half_macd = macd_vals[:10]
+    second_half_macd = macd_vals[10:]
+
+    # 강세 다이버전스
+    fh_low_idx = np.argmin(first_half_close)
+    sh_low_idx = np.argmin(second_half_close)
+    bullish = (second_half_close[sh_low_idx] < first_half_close[fh_low_idx]
+               and second_half_macd[sh_low_idx] > first_half_macd[fh_low_idx])
+
+    # 약세 다이버전스
+    fh_high_idx = np.argmax(first_half_close)
+    sh_high_idx = np.argmax(second_half_close)
+    bearish = (second_half_close[sh_high_idx] > first_half_close[fh_high_idx]
+               and second_half_macd[sh_high_idx] < first_half_macd[fh_high_idx])
+
+    # 제로라인 상향 돌파
+    zero_cross_up = bool(
+        pd.notna(today['MACD']) and pd.notna(yesterday['MACD'])
+        and yesterday['MACD'] <= 0 and today['MACD'] > 0
+    )
+
+    conds = {
+        '주가 저점↓ + MACD 저점↑ (강세)': bool(bullish),
+        '주가 고점↑ + MACD 고점↓ (약세)': bool(bearish),
+        'MACD 제로라인 상향돌파': zero_cross_up,
+        'MACD>Signal': bool(pd.notna(today['MACD']) and pd.notna(today['MACD_signal'])
+                            and today['MACD'] > today['MACD_signal']),
+    }
+    score = sum(conds.values())
+    detected = bullish or bearish or zero_cross_up
+    return detected, {'전략': 'MACD 다이버전스', '점수': f'{score}/4', '조건': conds}
+
+
+def _check_stochastic(df: pd.DataFrame) -> tuple:
+    """스토캐스틱 과매수/과매도 — %K, %D 교차로 단기 반전을 포착합니다.
+
+    ■ 매수 신호: %K와 %D가 모두 20 이하(과매도)에서 %K가 %D를 상향 돌파
+    ■ 매도 신호: %K와 %D가 모두 80 이상(과매수)에서 %K가 %D를 하향 돌파
+    """
+    if len(df) < 2:
+        return False, {}
+
+    today = df.iloc[-1]
+    yesterday = df.iloc[-2]
+
+    k = today.get('Stoch_K')
+    d = today.get('Stoch_D')
+    k_prev = yesterday.get('Stoch_K')
+    d_prev = yesterday.get('Stoch_D')
+
+    if any(pd.isna(v) for v in [k, d, k_prev, d_prev]):
+        return False, {}
+
+    # 매수: 과매도 구간에서 골든크로스
+    buy_signal = bool(k_prev <= d_prev and k > d and d < 20)
+    # 매도: 과매수 구간에서 데드크로스
+    sell_signal = bool(k_prev >= d_prev and k < d and d > 80)
+
+    conds = {
+        '과매도 골든크로스(%K↑%D, D<20)': buy_signal,
+        '과매수 데드크로스(%K↓%D, D>80)': sell_signal,
+        '%K 과매도(<20)': bool(k < 20),
+        '%K 과매수(>80)': bool(k > 80),
+        '%K값': round(float(k), 1),
+        '%D값': round(float(d), 1),
+    }
+    score = sum(1 for key in ['과매도 골든크로스(%K↑%D, D<20)',
+                               '과매수 데드크로스(%K↓%D, D>80)',
+                               '%K 과매도(<20)', '%K 과매수(>80)']
+                if conds[key])
+    detected = buy_signal or sell_signal
+    return detected, {'전략': '스토캐스틱', '점수': f'{score}/4', '조건': conds}
+
+
+def _check_bb_squeeze(df: pd.DataFrame) -> tuple:
+    """볼린저 밴드 스퀴즈 — 변동성 수축 후 확장을 포착합니다.
+
+    밴드 폭이 최근 20일 평균 대비 크게 축소된 뒤 다시 확장되기 시작하면
+    큰 방향성 움직임이 임박했음을 의미합니다.
+    종가 방향(상단 돌파/하단 이탈)으로 진입 방향을 판단합니다.
+    """
+    if len(df) < 5:
+        return False, {}
+
+    today = df.iloc[-1]
+    yesterday = df.iloc[-2]
+
+    bw = today.get('BB_width')
+    bw_ma = today.get('BB_width_MA20')
+    bw_prev = yesterday.get('BB_width')
+
+    if any(pd.isna(v) for v in [bw, bw_ma, bw_prev]):
+        return False, {}
+
+    # 스퀴즈: 현재 밴드폭이 20일 평균의 50% 이하
+    is_squeezed = bw < bw_ma * 0.5
+    # 확장 시작: 전일보다 밴드폭이 넓어지기 시작
+    expanding = bw > bw_prev
+    # 돌파 방향
+    breakout_up = bool(pd.notna(today['BB_upper']) and today['_close'] > today['BB_upper'])
+    breakout_down = bool(pd.notna(today['BB_lower']) and today['_close'] < today['BB_lower'])
+
+    conds = {
+        '밴드폭 < 20일평균×0.5 (스퀴즈)': bool(is_squeezed),
+        '밴드폭 확장 시작': bool(expanding),
+        '종가 > BB상단 (상방돌파)': breakout_up,
+        '종가 < BB하단 (하방이탈)': breakout_down,
+        '현재 밴드폭(%)': round(float(bw), 1),
+    }
+    score = sum(1 for key in ['밴드폭 < 20일평균×0.5 (스퀴즈)',
+                               '밴드폭 확장 시작',
+                               '종가 > BB상단 (상방돌파)',
+                               '종가 < BB하단 (하방이탈)']
+                if conds[key])
+    detected = (is_squeezed and expanding) or breakout_up or breakout_down
+    return detected, {'전략': 'BB 스퀴즈', '점수': f'{score}/4', '조건': conds}
+
+
+def _check_ichimoku_breakout(df: pd.DataFrame) -> tuple:
+    """일목균형표 구름대 돌파 — 추세 전환 및 강도를 종합 판단합니다.
+
+    ■ 전환선 > 기준선: 단기 상승 모멘텀
+    ■ 종가 > 구름대 상단: 강한 상승 추세 확인
+    ■ 구름대 상향 돌파 (전일 구름 내 → 당일 구름 위): 매수 신호
+    """
+    if len(df) < 2:
+        return False, {}
+
+    today = df.iloc[-1]
+    yesterday = df.iloc[-2]
+
+    tenkan = today.get('Ichi_tenkan')
+    kijun = today.get('Ichi_kijun')
+    spanA = today.get('Ichi_spanA')
+    spanB = today.get('Ichi_spanB')
+
+    if any(pd.isna(v) for v in [tenkan, kijun, spanA, spanB]):
+        return False, {}
+
+    cloud_top = max(spanA, spanB)
+    cloud_bottom = min(spanA, spanB)
+
+    prev_spanA = yesterday.get('Ichi_spanA')
+    prev_spanB = yesterday.get('Ichi_spanB')
+    if pd.notna(prev_spanA) and pd.notna(prev_spanB):
+        prev_cloud_top = max(prev_spanA, prev_spanB)
+        cloud_breakout = bool(yesterday['_close'] <= prev_cloud_top and today['_close'] > cloud_top)
+    else:
+        cloud_breakout = False
+
+    conds = {
+        '전환선 > 기준선': bool(tenkan > kijun),
+        '종가 > 구름대 상단': bool(today['_close'] > cloud_top),
+        '구름대 상향 돌파': cloud_breakout,
+        '구름 두께 양수(spanA>spanB, 상승 구름)': bool(spanA > spanB),
+    }
+    score = sum(conds.values())
+    detected = score >= 3 or cloud_breakout
+    return detected, {'전략': '일목균형표 돌파', '점수': f'{score}/4', '조건': conds}
+
+
+def _check_three_line_alignment(df: pd.DataFrame) -> tuple:
+    """3선 정배열/역배열 — 이동평균선 정렬 상태로 추세 강도를 판단합니다.
+
+    ■ 정배열 (MA5 > MA20 > MA60): 강한 상승 추세 → 매수 유리
+    ■ 역배열 (MA5 < MA20 < MA60): 강한 하락 추세 → 매수 불리
+    ■ 정배열 전환: 직전일 비정배열 → 당일 정배열 전환 시 초기 매수 신호
+    """
+    if len(df) < 2:
+        return False, {}
+
+    today = df.iloc[-1]
+    yesterday = df.iloc[-2]
+
+    ma5 = today.get('MA5')
+    ma20 = today.get('MA20')
+    ma60 = today.get('MA60')
+
+    if any(pd.isna(v) for v in [ma5, ma20, ma60]):
+        return False, {}
+
+    bullish_align = bool(ma5 > ma20 > ma60)
+    bearish_align = bool(ma5 < ma20 < ma60)
+
+    # 정배열 전환 감지 (어제는 아닌데 오늘 정배열)
+    prev_ma5 = yesterday.get('MA5')
+    prev_ma20 = yesterday.get('MA20')
+    prev_ma60 = yesterday.get('MA60')
+    if all(pd.notna(v) for v in [prev_ma5, prev_ma20, prev_ma60]):
+        was_not_bullish = not (prev_ma5 > prev_ma20 > prev_ma60)
+        just_aligned = bullish_align and was_not_bullish
+    else:
+        just_aligned = False
+
+    # MA5-MA20 간격이 벌어지는 중 (가속)
+    ma5_ma20_gap = (ma5 - ma20) / ma20 * 100 if ma20 > 0 else 0
+    accelerating = bool(ma5_ma20_gap > 1)  # 1% 이상 벌어짐
+
+    conds = {
+        'MA5>MA20>MA60 정배열': bullish_align,
+        'MA5<MA20<MA60 역배열': bearish_align,
+        '정배열 전환(신규)': bool(just_aligned),
+        'MA5-MA20 가속(1%↑)': accelerating,
+    }
+    score = sum(1 for key in ['MA5>MA20>MA60 정배열', '정배열 전환(신규)', 'MA5-MA20 가속(1%↑)']
+                if conds[key])
+    detected = bullish_align or just_aligned
+    return detected, {'전략': '3선 정배열', '점수': f'{score}/3', '조건': conds}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 전략 레지스트리 (기존 4 + 신규 6 = 10개)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
 SCREENING_STRATEGIES = [
+    # 기존 4개
     _check_golden_cross,
     _check_pullback,
     _check_momentum,
     _check_volume_breakout,
+    # 신규 6개
+    _check_rsi_divergence,
+    _check_macd_divergence,
+    _check_stochastic,
+    _check_bb_squeeze,
+    _check_ichimoku_breakout,
+    _check_three_line_alignment,
 ]
 
 
@@ -361,21 +697,21 @@ SCREENING_STRATEGIES = [
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def _fetch_naver_volume_top(market: str, max_pages: int) -> list[dict]:
-    """네이버 금융 거래량 상위 페이지에서 종목 리스트를 수집합니다.
+def _fetch_naver_sise_list(path: str, sosok: str, max_pages: int) -> list[dict]:
+    """네이버 금융 시세 테이블 페이지에서 종목 리스트를 수집하는 범용 헬퍼.
 
     Args:
-        market: 'KOSPI' 또는 'KOSDAQ'
-        max_pages: 조회할 페이지 수 (페이지당 약 40종목)
+        path: 페이지 경로 (예: 'sise_quant.naver', 'sise_rise.naver', 'sise_low_up.naver')
+        sosok: '0'=KOSPI, '1'=KOSDAQ
+        max_pages: 조회할 페이지 수
 
     Returns:
-        [{"code": "005930", "name": "삼성전자"}, ...]
+        [{"code": "005930", "name": "삼성전자"}, ...]  (이미 dedup됨)
     """
-    sosok = "0" if market.upper() == "KOSPI" else "1"
     items = []
     seen = set()
     for page in range(1, max_pages + 1):
-        url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}&page={page}"
+        url = f"https://finance.naver.com/sise/{path}?sosok={sosok}&page={page}"
         try:
             r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
             r.encoding = 'euc-kr'
@@ -397,9 +733,102 @@ def _fetch_naver_volume_top(market: str, max_pages: int) -> list[dict]:
     return items
 
 
+def _get_kr_candidates(market: str, limit: int) -> list[dict]:
+    """한국 주식 스크리닝용 넓은 시드 후보군을 수집합니다.
+
+    거래량 상위 + 상승률 상위 + 급등 리스트의 합집합. 20일 내 거래량 급증 필터
+    후처리를 전제로 하므로 시드를 넉넉히 확보합니다.
+    """
+    sosok_list = ["0", "1"] if market.upper() == "ALL" else \
+                 (["0"] if market.upper() == "KOSPI" else ["1"])
+    # 각 소스별 상위 N 수집 — 페이지당 ~40종목
+    sources = [
+        ("sise_quant.naver", 2),   # 거래량 상위
+        ("sise_rise.naver", 2),    # 상승률 상위
+        ("sise_low_up.naver", 2),  # 급등
+    ]
+    merged = []
+    seen = set()
+    for sosok in sosok_list:
+        for path, pages in sources:
+            for item in _fetch_naver_sise_list(path, sosok, pages):
+                if item['code'] in seen:
+                    continue
+                seen.add(item['code'])
+                merged.append(item)
+    return merged[:limit]
+
+
+def _fetch_yahoo_screener(scr_id: str, count: int = 50) -> list[str]:
+    """Yahoo Finance 내부 스크리너 API를 호출해 심볼 목록을 가져옵니다.
+
+    Args:
+        scr_id: 'most_actives' | 'day_gainers' | 'day_losers' | 'small_cap_gainers' 등
+        count: 가져올 종목 수 (최대 250)
+
+    Returns:
+        ["NVDA", "PLTR", ...]
+    """
+    url = (f"https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved"
+           f"?scrIds={scr_id}&count={count}")
+    try:
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        data = r.json()
+    except (requests.RequestException, ValueError):
+        return []
+    quotes = data.get('finance', {}).get('result', [{}])[0].get('quotes', [])
+    return [q.get('symbol') for q in quotes if q.get('symbol')]
+
+
+def _get_us_candidates(limit: int) -> list[str]:
+    """미국 주식 스크리닝용 넓은 시드 후보군을 수집합니다.
+
+    Yahoo most_actives + day_gainers + small_cap_gainers 의 합집합.
+    """
+    sources = ["most_actives", "day_gainers", "small_cap_gainers"]
+    merged = []
+    seen = set()
+    for scr_id in sources:
+        for sym in _fetch_yahoo_screener(scr_id, count=50):
+            if sym in seen:
+                continue
+            seen.add(sym)
+            merged.append(sym)
+    return merged[:limit]
+
+
+def _had_volume_spike(df: pd.DataFrame, volume_col: str,
+                      lookback: int = 20, baseline: int = 40,
+                      threshold: float = 3.0) -> tuple[bool, float]:
+    """최근 N 거래일 안에 거래량 폭발이 있었는지 판정.
+
+    판정식:
+        max(volume[최근 lookback일]) / mean(volume[그 이전 baseline일]) >= threshold
+
+    Args:
+        df: OHLCV 데이터프레임 (날짜 오름차순)
+        volume_col: 거래량 컬럼명 ('거래량' / 'Volume')
+        lookback: 폭발 이력을 찾을 최근 거래일 수
+        baseline: 비교 기준이 되는 과거 평균 구간 길이
+        threshold: 몇 배 이상을 "급증"으로 볼지
+
+    Returns:
+        (급증이력있음, 최대배율)
+    """
+    if len(df) < lookback + baseline:
+        return False, 0.0
+    recent = df[volume_col].iloc[-lookback:]
+    prior = df[volume_col].iloc[-(lookback + baseline):-lookback]
+    prior_mean = prior.mean()
+    if pd.isna(prior_mean) or prior_mean <= 0:
+        return False, 0.0
+    ratio = float(recent.max() / prior_mean)
+    return ratio >= threshold, round(ratio, 2)
+
+
 def _apply_strategies(df: pd.DataFrame, ticker: str, name: str,
                       close_col: str, volume_col: str) -> list[dict]:
-    """종목 하나에 4가지 전략을 적용해 통과한 결과만 반환합니다."""
+    """종목 하나에 전체 전략을 적용해 통과한 결과만 반환합니다."""
     hits = []
     latest = df.iloc[-1]
     prev = df.iloc[-2]
@@ -426,52 +855,63 @@ def _apply_strategies(df: pd.DataFrame, ticker: str, name: str,
 
 
 @mcp.tool()
-def screen_kr_stocks(market: str = "ALL", top_n: int = 80,
-                     min_trade_value: int = 500_000_000) -> str:
-    """한국 주식의 거래량 상위 종목 중 단기 상승 확률이 높은 종목을 필터링합니다.
+def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
+                     min_trade_value: int = 500_000_000,
+                     lookback_days: int = 20,
+                     spike_threshold: float = 3.0,
+                     baseline_days: int = 40) -> str:
+    """한국 주식에서 '최근 N일 내 거래량이 급증한 적 있는' 종목 중 단기 상승
+    확률이 높은 종목을 필터링합니다.
 
-    네이버 금융 '거래량 상위' 페이지에서 대상을 수집한 뒤,
-    각 종목의 200일 OHLCV로 4가지 전략(골든크로스+거래량, 눌림목 매수,
-    모멘텀 돌파, 거래량 폭발)을 적용합니다.
-    전체 시장 스캔(~2700종목) 대신 '거래량이 터진 종목'만 분석하므로 훨씬 빠릅니다.
+    [시드] 네이버 금융 거래량 상위 + 상승률 상위 + 급등 리스트 합집합
+    [필터] 각 종목 OHLCV로 `max(최근 lookback일 거래량) / 그 이전 baseline일
+           평균 거래량` >= spike_threshold 판정 (오늘 하루가 아니라 lookback 기간 중
+           단 하루라도 평상시 대비 폭발한 적 있으면 통과)
+    [전략] 10가지 기술적 전략 적용
 
     Args:
         market: 시장 선택 ('KOSPI', 'KOSDAQ', 'ALL'). 기본 'ALL'
-        top_n: 거래량 상위 몇 종목을 분석할지 (기본 80, 최대 200 권장)
+        top_n: 시드 후보 상한 (기본 150). 큰 값일수록 커버리지↑ 속도↓
         min_trade_value: 최소 거래대금 필터 (원). 기본 5억원
+        lookback_days: 거래량 급증 이력을 찾을 최근 거래일 수. 기본 20
+        spike_threshold: 급증 판정 배율 (N배 이상). 기본 3.0
+        baseline_days: 비교 기준이 되는 과거 평균 구간. 기본 40일
     """
-    # 1) 거래량 상위 후보 수집 (네이버)
-    markets = ["KOSPI", "KOSDAQ"] if market.upper() == "ALL" else [market.upper()]
-    per_market_quota = max(1, top_n // len(markets))
-    pages_per_market = max(1, -(-per_market_quota // 40))  # ceil(quota / 40)
-
-    candidates = []
-    for m in markets:
-        bucket = _fetch_naver_volume_top(m, pages_per_market)[:per_market_quota]
-        candidates.extend(bucket)
-    candidates = candidates[:top_n]
-
-    # 2) 후보별 심층 분석 (pykrx)
     today_str = datetime.today().strftime("%Y%m%d")
     start_str = (datetime.today() - timedelta(days=200)).strftime("%Y%m%d")
 
+    # 1) 넓은 시드 후보 수집
+    candidates = _get_kr_candidates(market, top_n)
+
+    # 2) 후보별 OHLCV 조회 → 20일내 거래량 급증 필터 → 전략 적용
     results = []
+    passed_spike_count = 0
     for cand in candidates:
         ticker = cand['code']
         name = cand['name']
         try:
             df = stock.get_market_ohlcv(start_str, today_str, ticker)
-            if len(df) < 60:
+            if len(df) < lookback_days + baseline_days:
                 continue
 
             latest_trade_value = df['종가'].iloc[-1] * df['거래량'].iloc[-1]
             if latest_trade_value < min_trade_value:
                 continue
 
+            had_spike, spike_ratio = _had_volume_spike(
+                df, '거래량', lookback_days, baseline_days, spike_threshold
+            )
+            if not had_spike:
+                continue
+            passed_spike_count += 1
+
             df = _calc_screening_indicators(
                 df, close='종가', high='고가', low='저가', open_='시가', volume='거래량'
             )
-            results.extend(_apply_strategies(df, ticker, name, '종가', '거래량'))
+            hits = _apply_strategies(df, ticker, name, '종가', '거래량')
+            for h in hits:
+                h['20일내_최대거래량배율'] = f"{spike_ratio}x"
+            results.extend(hits)
         except Exception:
             continue
 
@@ -483,14 +923,21 @@ def screen_kr_stocks(market: str = "ALL", top_n: int = 80,
     for r in results:
         r['복수전략'] = r['종목코드'] in multi_hits
 
-    # 복수전략 우선 → 점수 높은 순 정렬
     results.sort(key=lambda x: (x['복수전략'], x['점수']), reverse=True)
 
     output = {
         "스크리닝일": today_str,
         "대상시장": market.upper(),
-        "후보종목수": len(candidates),
+        "시드후보수": len(candidates),
+        "거래량급증_통과종목수": passed_spike_count,
         "필터링결과수": len(results),
+        "거래량급증_조건": f"최근 {lookback_days}일 중 이전 {baseline_days}일 평균 대비 {spike_threshold}x 이상",
+        "적용전략수": len(SCREENING_STRATEGIES),
+        "적용전략": [
+            "골든크로스+거래량", "눌림목 매수", "모멘텀 돌파", "거래량 폭발",
+            "RSI 다이버전스", "MACD 다이버전스", "스토캐스틱",
+            "BB 스퀴즈", "일목균형표 돌파", "3선 정배열",
+        ],
         "복수전략_충족종목": [
             {"종목코드": t, "종목명": next(r['종목명'] for r in results if r['종목코드'] == t),
              "해당전략": [r['전략'] for r in results if r['종목코드'] == t]}
@@ -506,52 +953,66 @@ def screen_kr_stocks(market: str = "ALL", top_n: int = 80,
 # 새 도구: 미국 주식 스크리닝
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# 미국 주요 종목 유니버스
-US_UNIVERSE = [
-    # 대형 기술주
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'AVGO',
-    'ORCL', 'CRM', 'AMD', 'ADBE', 'INTC', 'CSCO', 'QCOM', 'TXN',
-    'AMAT', 'MU', 'LRCX', 'KLAC', 'MRVL', 'SNPS', 'CDNS', 'PANW',
-    'CRWD', 'ABNB', 'DASH', 'COIN', 'SQ', 'SHOP', 'SNOW', 'DDOG',
-    'NET', 'ZS', 'MNDY', 'PLTR', 'RBLX', 'U', 'ROKU', 'TTD',
-    # 헬스케어 / 바이오
-    'UNH', 'JNJ', 'LLY', 'ABBV', 'MRK', 'PFE', 'TMO', 'ABT',
-    'AMGN', 'GILD', 'ISRG', 'VRTX', 'REGN', 'MRNA', 'BIIB',
-    # 금융
-    'BRK-B', 'JPM', 'V', 'MA', 'BAC', 'GS', 'MS', 'AXP',
-    # 소비재 / 산업
-    'WMT', 'HD', 'COST', 'NKE', 'SBUX', 'MCD', 'DIS', 'NFLX',
-    'BA', 'CAT', 'UPS', 'HON', 'GE', 'RTX', 'LMT',
-    # 에너지 / 소재
-    'XOM', 'CVX', 'COP', 'SLB', 'LIN', 'APD',
-    # ETF
-    'SPY', 'QQQ', 'IWM', 'ARKK', 'SOXX', 'XLF', 'XLE',
-]
-
 
 @mcp.tool()
-def screen_us_stocks(symbols: list[str] | None = None) -> str:
-    """미국 주식에서 단기 상승 확률이 높은 종목을 기술적 지표로 필터링합니다.
-    4가지 전략(골든크로스+거래량, 눌림목 매수, 모멘텀 돌파, 거래량 폭발)을 복합 적용합니다.
+def screen_us_stocks(symbols: list[str] | None = None,
+                     top_n: int = 100,
+                     lookback_days: int = 20,
+                     spike_threshold: float = 3.0,
+                     baseline_days: int = 40) -> str:
+    """미국 주식에서 '최근 N일 내 거래량이 급증한 적 있는' 종목 중 단기 상승
+    확률이 높은 종목을 필터링합니다.
+
+    [시드] symbols 미지정 시 Yahoo Finance `most_actives` + `day_gainers`
+           + `small_cap_gainers` 합집합에서 수집 (기존 하드코딩 유니버스 대체)
+    [필터] 각 종목 OHLCV로 `max(최근 lookback일 거래량) / 그 이전 baseline일
+           평균 거래량` >= spike_threshold 판정
+    [전략] 10가지 기술적 전략 적용
 
     Args:
-        symbols: 스크리닝할 티커 목록 (예: ['AAPL','TSLA','NVDA']). None이면 주요 90종목 기본 유니버스 사용
+        symbols: 스크리닝할 티커 목록. None이면 Yahoo 스크리너에서 시드 수집
+        top_n: 시드 후보 상한 (기본 100). symbols 지정 시 무시됨
+        lookback_days: 거래량 급증 이력을 찾을 최근 거래일 수. 기본 20
+        spike_threshold: 급증 판정 배율 (N배 이상). 기본 3.0
+        baseline_days: 비교 기준이 되는 과거 평균 구간. 기본 40일
     """
-    target_symbols = symbols if symbols else US_UNIVERSE
+    # 1) 시드 후보 결정
+    target_symbols = symbols if symbols else _get_us_candidates(top_n)
 
     end = datetime.now()
     start = end - timedelta(days=200)
     results = []
+    passed_spike_count = 0
+
+    # 2) 배치 다운로드 (개별 호출 대비 수~수십 배 빠름)
+    if not target_symbols:
+        batch = pd.DataFrame()
+    elif len(target_symbols) == 1:
+        single = yf.download(target_symbols[0], start=start, end=end,
+                             progress=False, auto_adjust=True)
+        if isinstance(single.columns, pd.MultiIndex):
+            single.columns = single.columns.get_level_values(0)
+        batch = {target_symbols[0]: single}
+    else:
+        batch = yf.download(target_symbols, start=start, end=end,
+                            progress=False, group_by='ticker',
+                            threads=True, auto_adjust=True)
 
     for symbol in target_symbols:
         try:
-            df = yf.download(symbol, start=start, end=end, progress=False)
-            if len(df) < 60:
+            if isinstance(batch, dict):
+                df = batch[symbol]
+            else:
+                df = batch[symbol].dropna(how='all')
+            if df.empty or len(df) < lookback_days + baseline_days:
                 continue
 
-            # MultiIndex 처리
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+            had_spike, spike_ratio = _had_volume_spike(
+                df, 'Volume', lookback_days, baseline_days, spike_threshold
+            )
+            if not had_spike:
+                continue
+            passed_spike_count += 1
 
             df = _calc_screening_indicators(
                 df, close='Close', high='High', low='Low', open_='Open', volume='Volume'
@@ -559,21 +1020,22 @@ def screen_us_stocks(symbols: list[str] | None = None) -> str:
 
             for strat_func in SCREENING_STRATEGIES:
                 passed, info = strat_func(df)
-                if passed:
-                    latest = df.iloc[-1]
-                    prev = df.iloc[-2]
-                    vol_ratio = round(latest['_volume'] / latest['Vol_MA5'], 1) if latest['Vol_MA5'] > 0 else 0
-
-                    results.append({
-                        "심볼": symbol,
-                        "전략": info['전략'],
-                        "점수": info['점수'],
-                        "현재가": round(latest['_close'], 2),
-                        "등락률": f"{round((latest['_close'] - prev['_close']) / prev['_close'] * 100, 2):+}%",
-                        "RSI": round(latest['RSI'], 1) if pd.notna(latest['RSI']) else None,
-                        "거래량비": f"{vol_ratio}x",
-                        "조건상세": info['조건'],
-                    })
+                if not passed:
+                    continue
+                latest = df.iloc[-1]
+                prev = df.iloc[-2]
+                vol_ratio = round(latest['_volume'] / latest['Vol_MA5'], 1) if latest['Vol_MA5'] > 0 else 0
+                results.append({
+                    "심볼": symbol,
+                    "전략": info['전략'],
+                    "점수": info['점수'],
+                    "현재가": round(float(latest['_close']), 2),
+                    "등락률": f"{round((latest['_close'] - prev['_close']) / prev['_close'] * 100, 2):+}%",
+                    "RSI": round(float(latest['RSI']), 1) if pd.notna(latest['RSI']) else None,
+                    "거래량비": f"{vol_ratio}x",
+                    "20일내_최대거래량배율": f"{spike_ratio}x",
+                    "조건상세": info['조건'],
+                })
         except Exception:
             continue
 
@@ -589,8 +1051,16 @@ def screen_us_stocks(symbols: list[str] | None = None) -> str:
 
     output = {
         "스크리닝일": datetime.today().strftime("%Y%m%d"),
-        "스캔종목수": len(target_symbols),
+        "시드종목수": len(target_symbols),
+        "거래량급증_통과종목수": passed_spike_count,
         "필터링결과수": len(results),
+        "거래량급증_조건": f"최근 {lookback_days}일 중 이전 {baseline_days}일 평균 대비 {spike_threshold}x 이상",
+        "적용전략수": len(SCREENING_STRATEGIES),
+        "적용전략": [
+            "골든크로스+거래량", "눌림목 매수", "모멘텀 돌파", "거래량 폭발",
+            "RSI 다이버전스", "MACD 다이버전스", "스토캐스틱",
+            "BB 스퀴즈", "일목균형표 돌파", "3선 정배열",
+        ],
         "복수전략_충족종목": [
             {"심볼": t,
              "해당전략": [r['전략'] for r in results if r['심볼'] == t]}
@@ -609,7 +1079,11 @@ def screen_us_stocks(symbols: list[str] | None = None) -> str:
 
 @mcp.tool()
 def diagnose_stock(ticker: str, market: str = "KR") -> str:
-    """특정 종목이 4가지 단기 전략 중 어떤 조건에 해당하는지 상세 진단합니다.
+    """특정 종목이 10가지 단기 전략 중 어떤 조건에 해당하는지 상세 진단합니다.
+
+    ■ 기존 전략: 골든크로스+거래량, 눌림목 매수, 모멘텀 돌파, 거래량 폭발
+    ■ 신규 전략: RSI 다이버전스, MACD 다이버전스, 스토캐스틱 과매수/과매도,
+                BB 스퀴즈, 일목균형표 구름대 돌파, 3선 정배열/역배열
 
     Args:
         ticker: 종목코드 (한국) 또는 티커심볼 (미국). 예: '005930', 'AAPL'
@@ -665,7 +1139,7 @@ def diagnose_stock(ticker: str, market: str = "KR") -> str:
         "등락률": f"{round((latest['_close'] - prev['_close']) / prev['_close'] * 100, 2):+}%",
         "RSI": round(float(latest['RSI']), 1) if pd.notna(latest['RSI']) else None,
         "거래량비": f"{vol_ratio}x",
-        "충족전략수": len(passed_strategies),
+        "충족전략수": f"{len(passed_strategies)}/{len(SCREENING_STRATEGIES)}",
         "충족전략": passed_strategies,
         "전략별진단": diagnoses,
     }
