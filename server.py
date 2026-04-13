@@ -672,10 +672,109 @@ def _check_three_line_alignment(df: pd.DataFrame) -> tuple:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 전략 레지스트리 (기존 4 + 신규 6 = 10개)
+# Breakout 전용 전략 (곧 달릴 말 찾기 — VCP / 매집 / Stage 1 말기)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+def _check_vcp(df: pd.DataFrame) -> tuple:
+    """VCP (Volatility Contraction Pattern) — 변동성 점진 수축.
+
+    Mark Minervini의 실전 검증 패턴. 최근 15일을 5일씩 3구간으로 나눠
+    각 구간의 고저 범위(%)가 순차 축소하면 돌파 임박 코일링으로 판단.
+    """
+    if len(df) < 20:
+        return False, {}
+    segs = [df.iloc[-15:-10], df.iloc[-10:-5], df.iloc[-5:]]
+    ranges_pct = []
+    for seg in segs:
+        mean_close = seg['_close'].mean()
+        if len(seg) < 5 or pd.isna(mean_close) or mean_close <= 0:
+            return False, {}
+        ranges_pct.append(
+            float((seg['_high'].max() - seg['_low'].min()) / mean_close * 100)
+        )
+    r_old, r_mid, r_new = ranges_pct
+    today = df.iloc[-1]
+
+    conds = {
+        '변동폭 3→2→1 순차축소': bool(r_old > r_mid > r_new),
+        '총 수축폭 ≥ 30%': bool(r_old > 0 and (r_old - r_new) / r_old >= 0.30),
+        '종가 > MA60 (지지)': bool(pd.notna(today['MA60']) and today['_close'] > today['MA60']),
+        '최근 5일 변동폭 ≤ 5% (코일)': bool(r_new <= 5),
+    }
+    score = sum(conds.values())
+    return score >= 3, {'전략': 'VCP 변동성 수축', '점수': f'{score}/4', '조건': conds}
+
+
+def _check_silent_accumulation(df: pd.DataFrame) -> tuple:
+    """조용한 매집 — 거래량↑ 가격→ 횡보 (세력 매집 전형).
+
+    최근 20일 동안 거래량 평균이 이전 20일 대비 증가하고 급증일도 있지만,
+    같은 20일 가격 변동폭은 좁다 → 시장에 드러나지 않은 누적 매수.
+    """
+    if len(df) < 40:
+        return False, {}
+    last20 = df.iloc[-20:]
+    prev20 = df.iloc[-40:-20]
+    vol_mean_last = last20['_volume'].mean()
+    vol_mean_prev = prev20['_volume'].mean()
+    if pd.isna(vol_mean_prev) or vol_mean_prev <= 0:
+        return False, {}
+
+    price_range_pct = float(
+        (last20['_high'].max() - last20['_low'].min()) / last20['_close'].mean() * 100
+    )
+    vol_spike_days = int((last20['_volume'] > vol_mean_prev * 2).sum())
+    today = df.iloc[-1]
+
+    conds = {
+        '20일 거래량 평균 ≥ 이전 20일 × 1.3': bool(vol_mean_last >= vol_mean_prev * 1.3),
+        '20일 내 거래량 급증일(>2x) 존재': bool(vol_spike_days >= 1),
+        '20일 가격 변동폭 ≤ 16% (±8% 횡보)': bool(price_range_pct <= 16),
+        '종가 > MA60 (바닥 이탈 확인)': bool(pd.notna(today['MA60']) and today['_close'] > today['MA60']),
+    }
+    score = sum(conds.values())
+    return score >= 3, {'전략': '조용한 매집', '점수': f'{score}/4', '조건': conds}
+
+
+def _check_stage1_late(df: pd.DataFrame) -> tuple:
+    """Stage 1 말기 전환 — 바닥 박스권 탈출 조짐.
+
+    장기 횡보(Stage 1)에서 완만한 상승(Stage 2 초입)으로 넘어가는 구간을
+    MA60 기울기·MA20/60 교차·BB폭 등으로 포착.
+    """
+    if len(df) < 90:
+        return False, {}
+    today = df.iloc[-1]
+    ma60 = today['MA60']
+    ma60_1m_ago = df['MA60'].iloc[-21]
+    ma20 = today['MA20']
+
+    conds = {
+        'MA60 1개월전 대비 상승': bool(
+            pd.notna(ma60) and pd.notna(ma60_1m_ago) and ma60 > ma60_1m_ago
+        ),
+        'MA20 > MA60 (단기 상향전환)': bool(
+            pd.notna(ma20) and pd.notna(ma60) and ma20 > ma60
+        ),
+        '종가 > MA60 (지지 확보)': bool(
+            pd.notna(ma60) and today['_close'] > ma60
+        ),
+        'BB폭 ≤ 20일평균 (아직 미확장)': bool(
+            pd.notna(today['BB_width']) and pd.notna(today['BB_width_MA20'])
+            and today['BB_width'] <= today['BB_width_MA20']
+        ),
+    }
+    score = sum(conds.values())
+    return score >= 3, {'전략': 'Stage 1 말기 전환', '점수': f'{score}/4', '조건': conds}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 전략 레지스트리
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+# Momentum 전략 (달리는 말 잡아타기) — 기존 4 + 신규 6 = 10개
 SCREENING_STRATEGIES = [
     # 기존 4개
     _check_golden_cross,
@@ -692,8 +791,20 @@ SCREENING_STRATEGIES = [
 ]
 
 
+# Breakout 전략 (곧 달릴 말 찾기) — 7개
+BREAKOUT_STRATEGIES = [
+    _check_pullback,            # 재사용: 눌림목 매수 (스테이지 전환)
+    _check_volume_breakout,     # 재사용: 거래량 폭발 (초기 포착)
+    _check_macd_divergence,     # 재사용: MACD 다이버전스 (바닥 반전)
+    _check_bb_squeeze,          # 재사용: BB 스퀴즈 (변동성 수축)
+    _check_vcp,                 # 신규: VCP 변동성 수축
+    _check_silent_accumulation, # 신규: 조용한 매집
+    _check_stage1_late,         # 신규: Stage 1 말기 전환
+]
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 새 도구: 한국 주식 스크리닝
+# 스크리닝 공통 헬퍼 (시드 수집 / 사전필터 / 전략 적용)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
@@ -903,9 +1014,54 @@ def _compute_rs_delta(df: pd.DataFrame, close_col: str,
     return round(stock_return - benchmark_return_pct, 2)
 
 
+def _check_not_extended(df: pd.DataFrame, close_col: str,
+                        period: int = 30,
+                        max_return_pct: float = 30.0) -> tuple[bool, float]:
+    """최근 N일 누적 상승률이 상한 이하인지 (아직 큰 움직임 없는 종목 선별).
+
+    Returns: (통과여부, 누적수익률pct)
+    """
+    if len(df) < period + 1:
+        return False, 0.0
+    prev = df[close_col].iloc[-period - 1]
+    if pd.isna(prev) or prev <= 0:
+        return False, 0.0
+    ret = float((df[close_col].iloc[-1] / prev - 1) * 100)
+    return ret < max_return_pct, round(ret, 2)
+
+
+def _check_52w_band(df: pd.DataFrame, close_col: str, high_col: str, low_col: str,
+                    high_ceiling: float = 0.85, low_floor: float = 1.20,
+                    lookback_52w: int = 252) -> tuple[bool, dict]:
+    """52주 고점 상한 + 52주 저점 하한 밴드 (중간권 매집 종목 선별).
+
+    통과 조건: (종가 ≤ 52주고점 × high_ceiling) AND (종가 ≥ 52주저점 × low_floor)
+    """
+    if df.empty:
+        return False, {}
+    window = df.iloc[-lookback_52w:] if len(df) >= lookback_52w else df
+    high_52w = window[high_col].max()
+    low_52w = window[low_col].min()
+    if pd.isna(high_52w) or pd.isna(low_52w) or high_52w <= 0 or low_52w <= 0:
+        return False, {}
+    close = df[close_col].iloc[-1]
+    passed = (close <= high_52w * high_ceiling) and (close >= low_52w * low_floor)
+    return passed, {
+        "52주고점대비": round(close / high_52w, 3),
+        "52주저점대비": round(close / low_52w, 3),
+    }
+
+
 def _apply_strategies(df: pd.DataFrame, ticker: str, name: str,
-                      close_col: str, volume_col: str) -> list[dict]:
-    """종목 하나에 전체 전략을 적용해 통과한 결과만 반환합니다."""
+                      close_col: str, volume_col: str,
+                      strategies: list | None = None) -> list[dict]:
+    """종목 하나에 전략 목록을 적용해 통과한 결과만 반환합니다.
+
+    Args:
+        strategies: 적용할 전략 함수 리스트. None이면 SCREENING_STRATEGIES(momentum).
+    """
+    if strategies is None:
+        strategies = SCREENING_STRATEGIES
     hits = []
     latest = df.iloc[-1]
     prev = df.iloc[-2]
@@ -913,7 +1069,7 @@ def _apply_strategies(df: pd.DataFrame, ticker: str, name: str,
     vol_ratio = round(latest[volume_col] / vol_ma5, 1) if vol_ma5 > 0 else 0
     change_pct = round((latest[close_col] - prev[close_col]) / prev[close_col] * 100, 2)
 
-    for strat_func in SCREENING_STRATEGIES:
+    for strat_func in strategies:
         passed, info = strat_func(df)
         if not passed:
             continue
@@ -931,8 +1087,13 @@ def _apply_strategies(df: pd.DataFrame, ticker: str, name: str,
     return hits
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 한국 주식 — Momentum 스크리닝 (달리는 말 잡아타기)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
 @mcp.tool()
-def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
+def screen_kr_momentum(market: str = "ALL", top_n: int = 150,
                      min_trade_value: int = 500_000_000,
                      exclude_if_up_pct: float | None = 10.0,
                      lookback_days: int = 20,
@@ -1091,12 +1252,12 @@ def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 새 도구: 미국 주식 스크리닝
+# 미국 주식 — Momentum 스크리닝 (달리는 말 잡아타기)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
 @mcp.tool()
-def screen_us_stocks(symbols: list[str] | None = None,
+def screen_us_momentum(symbols: list[str] | None = None,
                      top_n: int = 100,
                      exclude_if_up_pct: float | None = 10.0,
                      lookback_days: int = 20,
@@ -1277,6 +1438,300 @@ def screen_us_stocks(symbols: list[str] | None = None,
     }
 
     return json.dumps(output, ensure_ascii=False, indent=2)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 한국 주식 — Breakout 스크리닝 (곧 달릴 말 찾기)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+@mcp.tool()
+def screen_kr_breakout(market: str = "ALL", top_n: int = 150,
+                       min_trade_value: int = 500_000_000,
+                       exclude_if_up_pct: float | None = 10.0,
+                       max_cumulative_return_pct: float = 30.0,
+                       cumulative_return_days: int = 30,
+                       high_ceiling: float = 0.85,
+                       low_floor: float = 1.20,
+                       lookback_days: int = 20,
+                       spike_threshold: float = 2.0,
+                       baseline_days: int = 40) -> str:
+    """한국 주식에서 '곧 달릴 말' — 매집/돌파 직전 단계 종목을 필터링합니다.
+
+    `screen_kr_momentum`과 반대 컨셉. 이미 크게 오른 종목을 배제하고
+    중간권에서 매집 중인 종목 / 변동성 수축 국면 / Stage 1 말기 종목을 찾습니다.
+
+    [시드] 네이버 거래량상위 + 상승률상위 + 급등 합집합
+    [사전필터] 순차 적용:
+      · 거래대금
+      · 당일 과열 제외 (`exclude_if_up_pct`)
+      · 최근 N일 누적 상승률 < `max_cumulative_return_pct` (아직 안 달림)
+      · 52주 밴드 (고점 × `high_ceiling` 이하 AND 저점 × `low_floor` 이상)
+      · 거래량 급증 (기본 2x — momentum의 3x보다 약해도 매집 시그널로 인정)
+    [전략] Breakout 전용 7개
+      - 재사용: 눌림목 매수 · 거래량 폭발 · MACD 다이버전스 · BB 스퀴즈
+      - 신규: VCP 변동성 수축 · 조용한 매집 · Stage 1 말기 전환
+
+    Args:
+        market: 'KOSPI' | 'KOSDAQ' | 'ALL'
+        top_n: 시드 후보 상한
+        min_trade_value: 최소 거래대금(원)
+        exclude_if_up_pct: 오늘 이 % 이상 오른 종목 제외 (None 미적용)
+        max_cumulative_return_pct: 최근 N일 누적 상승률 상한(%) (기본 30)
+        cumulative_return_days: 누적 상승률 계산 기간 (기본 30)
+        high_ceiling: 52주 고점 대비 상한 비율 (0.85 = 고점의 85% 이하)
+        low_floor: 52주 저점 대비 하한 비율 (1.20 = 저점의 120% 이상)
+        lookback_days: 거래량 급증 룩백
+        spike_threshold: 거래량 급증 배율 (기본 2.0)
+        baseline_days: 비교 기준 기간
+    """
+    today_str = datetime.today().strftime("%Y%m%d")
+    start_str = (datetime.today() - timedelta(days=365)).strftime("%Y%m%d")
+
+    candidates = _get_kr_candidates(market, top_n)
+    results = []
+    funnel = {"당일과열제외": 0, "누적상승한도": 0, "52주밴드": 0, "거래량급증": 0}
+
+    for cand in candidates:
+        ticker = cand['code']
+        name = cand['name']
+        try:
+            df = stock.get_market_ohlcv(start_str, today_str, ticker)
+            if len(df) < lookback_days + baseline_days:
+                continue
+
+            latest_trade_value = df['종가'].iloc[-1] * df['거래량'].iloc[-1]
+            if latest_trade_value < min_trade_value:
+                continue
+
+            if exclude_if_up_pct is not None:
+                today_close = df['종가'].iloc[-1]
+                prev_close = df['종가'].iloc[-2]
+                if prev_close > 0:
+                    change_pct = (today_close - prev_close) / prev_close * 100
+                    if change_pct >= exclude_if_up_pct:
+                        continue
+            funnel["당일과열제외"] += 1
+
+            passed_ext, cumret = _check_not_extended(
+                df, '종가', cumulative_return_days, max_cumulative_return_pct
+            )
+            if not passed_ext:
+                continue
+            funnel["누적상승한도"] += 1
+
+            passed_band, band_info = _check_52w_band(
+                df, '종가', '고가', '저가', high_ceiling, low_floor
+            )
+            if not passed_band:
+                continue
+            funnel["52주밴드"] += 1
+
+            had_spike, spike_ratio = _had_volume_spike(
+                df, '거래량', lookback_days, baseline_days, spike_threshold
+            )
+            if not had_spike:
+                continue
+            funnel["거래량급증"] += 1
+
+            df = _calc_screening_indicators(
+                df, close='종가', high='고가', low='저가', open_='시가', volume='거래량'
+            )
+            hits = _apply_strategies(df, ticker, name, '종가', '거래량',
+                                     strategies=BREAKOUT_STRATEGIES)
+            for h in hits:
+                h[f'{cumulative_return_days}일누적'] = f"{cumret:+}%"
+                h['20일내_최대거래량배율'] = f"{spike_ratio}x"
+                h['52주고점대비'] = f"{round(band_info['52주고점대비'] * 100, 1)}%"
+                h['52주저점대비'] = f"{round(band_info['52주저점대비'] * 100, 1)}%"
+            results.extend(hits)
+        except Exception:
+            continue
+
+    from collections import Counter
+    ticker_counts = Counter(r['종목코드'] for r in results)
+    multi_hits = {t for t, c in ticker_counts.items() if c > 1}
+    for r in results:
+        r['복수전략'] = r['종목코드'] in multi_hits
+    results.sort(key=lambda x: (x['복수전략'], x['점수']), reverse=True)
+
+    return json.dumps({
+        "스크리닝일": today_str,
+        "모드": "Breakout (곧 달릴 말)",
+        "대상시장": market.upper(),
+        "시드후보수": len(candidates),
+        "필터링_단계별_통과": funnel,
+        "필터링결과수": len(results),
+        "필터링조건": {
+            "당일과열제외": f"+{exclude_if_up_pct}% 이상" if exclude_if_up_pct is not None else "미적용",
+            "누적상승한도": f"최근 {cumulative_return_days}일 +{max_cumulative_return_pct}% 미만",
+            "52주밴드": f"고점 × {high_ceiling} 이하 AND 저점 × {low_floor} 이상",
+            "거래량급증": f"최근 {lookback_days}일 중 이전 {baseline_days}일 평균 대비 {spike_threshold}x 이상",
+        },
+        "적용전략수": len(BREAKOUT_STRATEGIES),
+        "적용전략": ["눌림목 매수", "거래량 폭발", "MACD 다이버전스", "BB 스퀴즈",
+                  "VCP 변동성 수축", "조용한 매집", "Stage 1 말기 전환"],
+        "복수전략_충족종목": [
+            {"종목코드": t, "종목명": next(r['종목명'] for r in results if r['종목코드'] == t),
+             "해당전략": [r['전략'] for r in results if r['종목코드'] == t]}
+            for t in multi_hits
+        ],
+        "결과": results,
+    }, ensure_ascii=False, indent=2)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 미국 주식 — Breakout 스크리닝 (곧 달릴 말 찾기)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+@mcp.tool()
+def screen_us_breakout(symbols: list[str] | None = None,
+                       top_n: int = 100,
+                       exclude_if_up_pct: float | None = 10.0,
+                       max_cumulative_return_pct: float = 30.0,
+                       cumulative_return_days: int = 30,
+                       high_ceiling: float = 0.85,
+                       low_floor: float = 1.20,
+                       lookback_days: int = 20,
+                       spike_threshold: float = 2.0,
+                       baseline_days: int = 40) -> str:
+    """미국 주식에서 '곧 달릴 말' — 매집/돌파 직전 단계 종목을 필터링합니다.
+
+    `screen_us_momentum`과 반대 컨셉. 이미 크게 오른 종목을 배제하고
+    중간권에서 매집 중인 종목 / 변동성 수축 국면 / Stage 1 말기 종목을 찾습니다.
+
+    [시드] symbols 미지정 시 Yahoo `most_actives` + `day_gainers` + `small_cap_gainers`
+    [사전필터] KR breakout과 동일 구조
+    [전략] Breakout 전용 7개
+
+    Args:
+        symbols: 스크리닝할 티커 목록. None이면 Yahoo 스크리너에서 시드 수집
+        top_n: 시드 후보 상한
+        exclude_if_up_pct: 오늘 이 % 이상 오른 종목 제외
+        max_cumulative_return_pct: 최근 N일 누적 상승률 상한
+        cumulative_return_days: 누적 상승률 계산 기간
+        high_ceiling: 52주 고점 대비 상한 (0.85 = 고점의 85% 이하)
+        low_floor: 52주 저점 대비 하한 (1.20 = 저점의 120% 이상)
+        lookback_days: 거래량 급증 룩백
+        spike_threshold: 거래량 급증 배율 (기본 2.0)
+        baseline_days: 비교 기준 기간
+    """
+    target_symbols = symbols if symbols else _get_us_candidates(top_n)
+
+    end = datetime.now()
+    start = end - timedelta(days=365)
+    results = []
+    funnel = {"당일과열제외": 0, "누적상승한도": 0, "52주밴드": 0, "거래량급증": 0}
+
+    if not target_symbols:
+        batch = pd.DataFrame()
+    elif len(target_symbols) == 1:
+        single = yf.download(target_symbols[0], start=start, end=end,
+                             progress=False, auto_adjust=True)
+        if isinstance(single.columns, pd.MultiIndex):
+            single.columns = single.columns.get_level_values(0)
+        batch = {target_symbols[0]: single}
+    else:
+        batch = yf.download(target_symbols, start=start, end=end,
+                            progress=False, group_by='ticker',
+                            threads=True, auto_adjust=True)
+
+    for symbol in target_symbols:
+        try:
+            if isinstance(batch, dict):
+                df = batch[symbol]
+            else:
+                df = batch[symbol].dropna(how='all')
+            if df.empty or len(df) < lookback_days + baseline_days:
+                continue
+
+            if exclude_if_up_pct is not None:
+                today_close = df['Close'].iloc[-1]
+                prev_close = df['Close'].iloc[-2]
+                if prev_close > 0:
+                    change_pct = (today_close - prev_close) / prev_close * 100
+                    if change_pct >= exclude_if_up_pct:
+                        continue
+            funnel["당일과열제외"] += 1
+
+            passed_ext, cumret = _check_not_extended(
+                df, 'Close', cumulative_return_days, max_cumulative_return_pct
+            )
+            if not passed_ext:
+                continue
+            funnel["누적상승한도"] += 1
+
+            passed_band, band_info = _check_52w_band(
+                df, 'Close', 'High', 'Low', high_ceiling, low_floor
+            )
+            if not passed_band:
+                continue
+            funnel["52주밴드"] += 1
+
+            had_spike, spike_ratio = _had_volume_spike(
+                df, 'Volume', lookback_days, baseline_days, spike_threshold
+            )
+            if not had_spike:
+                continue
+            funnel["거래량급증"] += 1
+
+            df = _calc_screening_indicators(
+                df, close='Close', high='High', low='Low', open_='Open', volume='Volume'
+            )
+
+            for strat_func in BREAKOUT_STRATEGIES:
+                passed, info = strat_func(df)
+                if not passed:
+                    continue
+                latest = df.iloc[-1]
+                prev = df.iloc[-2]
+                vol_ratio = round(latest['_volume'] / latest['Vol_MA5'], 1) if latest['Vol_MA5'] > 0 else 0
+                results.append({
+                    "심볼": symbol,
+                    "전략": info['전략'],
+                    "점수": info['점수'],
+                    "현재가": round(float(latest['_close']), 2),
+                    "등락률": f"{round((latest['_close'] - prev['_close']) / prev['_close'] * 100, 2):+}%",
+                    "RSI": round(float(latest['RSI']), 1) if pd.notna(latest['RSI']) else None,
+                    "거래량비": f"{vol_ratio}x",
+                    f"{cumulative_return_days}일누적": f"{cumret:+}%",
+                    "20일내_최대거래량배율": f"{spike_ratio}x",
+                    "52주고점대비": f"{round(band_info['52주고점대비'] * 100, 1)}%",
+                    "52주저점대비": f"{round(band_info['52주저점대비'] * 100, 1)}%",
+                    "조건상세": info['조건'],
+                })
+        except Exception:
+            continue
+
+    from collections import Counter
+    ticker_counts = Counter(r['심볼'] for r in results)
+    multi_hits = {t for t, c in ticker_counts.items() if c > 1}
+    for r in results:
+        r['복수전략'] = r['심볼'] in multi_hits
+    results.sort(key=lambda x: (x['복수전략'], x['점수']), reverse=True)
+
+    return json.dumps({
+        "스크리닝일": datetime.today().strftime("%Y%m%d"),
+        "모드": "Breakout (곧 달릴 말)",
+        "시드종목수": len(target_symbols),
+        "필터링_단계별_통과": funnel,
+        "필터링결과수": len(results),
+        "필터링조건": {
+            "당일과열제외": f"+{exclude_if_up_pct}% 이상" if exclude_if_up_pct is not None else "미적용",
+            "누적상승한도": f"최근 {cumulative_return_days}일 +{max_cumulative_return_pct}% 미만",
+            "52주밴드": f"고점 × {high_ceiling} 이하 AND 저점 × {low_floor} 이상",
+            "거래량급증": f"최근 {lookback_days}일 중 이전 {baseline_days}일 평균 대비 {spike_threshold}x 이상",
+        },
+        "적용전략수": len(BREAKOUT_STRATEGIES),
+        "적용전략": ["눌림목 매수", "거래량 폭발", "MACD 다이버전스", "BB 스퀴즈",
+                  "VCP 변동성 수축", "조용한 매집", "Stage 1 말기 전환"],
+        "복수전략_충족종목": [
+            {"심볼": t, "해당전략": [r['전략'] for r in results if r['심볼'] == t]}
+            for t in multi_hits
+        ],
+        "결과": results,
+    }, ensure_ascii=False, indent=2)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
