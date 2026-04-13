@@ -826,6 +826,83 @@ def _had_volume_spike(df: pd.DataFrame, volume_col: str,
     return ratio >= threshold, round(ratio, 2)
 
 
+def _check_trend_template(df: pd.DataFrame, close_col: str, high_col: str,
+                          low_col: str, lookback_52w: int = 252) -> tuple[bool, dict]:
+    """Minervini Trend Template — Stage 2 상승추세 판정.
+
+    6가지 조건을 모두 충족해야 통과:
+      1) 종가 > MA50
+      2) MA50 > MA150
+      3) MA150 > MA200
+      4) MA200이 1개월 전보다 상승
+      5) 현재가 ≥ 52주 저점 × 1.30 (저점에서 30% 이상 오름)
+      6) 현재가 ≥ 52주 고점 × 0.75 (고점의 25% 범위 내)
+    """
+    if len(df) < 200:
+        return False, {"사유": f"데이터부족({len(df)}일, 200일 필요)"}
+
+    close = df[close_col]
+    latest = close.iloc[-1]
+    ma50 = close.rolling(50).mean().iloc[-1]
+    ma150 = close.rolling(150).mean().iloc[-1]
+    ma200_series = close.rolling(200).mean()
+    ma200 = ma200_series.iloc[-1]
+    ma200_1m = ma200_series.iloc[-21] if len(df) >= 221 else None
+
+    window = df.iloc[-lookback_52w:] if len(df) >= lookback_52w else df
+    high_52w = window[high_col].max()
+    low_52w = window[low_col].min()
+
+    conds = {
+        "종가 > MA50": bool(pd.notna(ma50) and latest > ma50),
+        "MA50 > MA150": bool(pd.notna(ma50) and pd.notna(ma150) and ma50 > ma150),
+        "MA150 > MA200": bool(pd.notna(ma150) and pd.notna(ma200) and ma150 > ma200),
+        "MA200 1개월전 대비 상승": bool(ma200_1m is not None and pd.notna(ma200) and ma200 > ma200_1m),
+        "52주저점 +30% 이상": bool(low_52w > 0 and latest >= low_52w * 1.30),
+        "52주고점 -25% 이내": bool(high_52w > 0 and latest >= high_52w * 0.75),
+    }
+    return all(conds.values()), conds
+
+
+def _check_near_52w_high(df: pd.DataFrame, close_col: str, high_col: str,
+                         threshold: float = 0.75,
+                         lookback_52w: int = 252) -> tuple[bool, float]:
+    """52주 고점 근접 필터.
+
+    현재가 ≥ 52주 고점 × threshold 인지 판정.
+    Returns: (통과여부, 52주고점대비 현재가 비율 0~1)
+    """
+    if df.empty:
+        return False, 0.0
+    window = df.iloc[-lookback_52w:] if len(df) >= lookback_52w else df
+    high_52w = window[high_col].max()
+    if pd.isna(high_52w) or high_52w <= 0:
+        return False, 0.0
+    ratio = float(df[close_col].iloc[-1] / high_52w)
+    return ratio >= threshold, round(ratio, 3)
+
+
+def _compute_rs_delta(df: pd.DataFrame, close_col: str,
+                      benchmark_return_pct: float,
+                      period_days: int = 63) -> float | None:
+    """종목의 N일 수익률과 벤치마크 수익률 차이(퍼센트 포인트).
+
+    Args:
+        period_days: 수익률 계산 구간 (기본 63일 ≈ 3개월)
+
+    Returns:
+        `종목_수익률 - 벤치마크_수익률` (pp). 데이터 부족시 None.
+    """
+    if len(df) < period_days + 1:
+        return None
+    close_now = df[close_col].iloc[-1]
+    close_then = df[close_col].iloc[-period_days - 1]
+    if pd.isna(close_now) or pd.isna(close_then) or close_then <= 0:
+        return None
+    stock_return = (close_now / close_then - 1) * 100
+    return round(stock_return - benchmark_return_pct, 2)
+
+
 def _apply_strategies(df: pd.DataFrame, ticker: str, name: str,
                       close_col: str, volume_col: str) -> list[dict]:
     """종목 하나에 전체 전략을 적용해 통과한 결과만 반환합니다."""
@@ -859,33 +936,55 @@ def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
                      min_trade_value: int = 500_000_000,
                      lookback_days: int = 20,
                      spike_threshold: float = 3.0,
-                     baseline_days: int = 40) -> str:
-    """한국 주식에서 '최근 N일 내 거래량이 급증한 적 있는' 종목 중 단기 상승
-    확률이 높은 종목을 필터링합니다.
+                     baseline_days: int = 40,
+                     enable_trend_template: bool = True,
+                     enable_near_52w_high: bool = True,
+                     high_proximity: float = 0.75,
+                     enable_rs_filter: bool = False,
+                     rs_period_days: int = 63,
+                     min_rs_outperformance: float = 0.0) -> str:
+    """한국 주식에서 '최근 N일 내 거래량 급증 + 추세 정합' 종목을 필터링합니다.
 
-    [시드] 네이버 금융 거래량 상위 + 상승률 상위 + 급등 리스트 합집합
-    [필터] 각 종목 OHLCV로 `max(최근 lookback일 거래량) / 그 이전 baseline일
-           평균 거래량` >= spike_threshold 판정 (오늘 하루가 아니라 lookback 기간 중
-           단 하루라도 평상시 대비 폭발한 적 있으면 통과)
+    [시드] 네이버 거래량상위 + 상승률상위 + 급등 합집합
+    [사전필터] 순차 적용:
+      · 거래대금: `min_trade_value` 이상
+      · 거래량 급증: `max(최근 lookback일) / 이전 baseline일 평균` ≥ `spike_threshold`
+      · Minervini Trend Template (옵션): Stage 2 상승추세 6조건
+      · 52주 고점 근접 (옵션): 현재가 ≥ 52주고점 × `high_proximity`
+      · RS vs KODEX 200 (옵션): 3개월 초과수익률 ≥ `min_rs_outperformance` (pp)
     [전략] 10가지 기술적 전략 적용
 
     Args:
-        market: 시장 선택 ('KOSPI', 'KOSDAQ', 'ALL'). 기본 'ALL'
-        top_n: 시드 후보 상한 (기본 150). 큰 값일수록 커버리지↑ 속도↓
-        min_trade_value: 최소 거래대금 필터 (원). 기본 5억원
-        lookback_days: 거래량 급증 이력을 찾을 최근 거래일 수. 기본 20
-        spike_threshold: 급증 판정 배율 (N배 이상). 기본 3.0
-        baseline_days: 비교 기준이 되는 과거 평균 구간. 기본 40일
+        market: 'KOSPI' | 'KOSDAQ' | 'ALL'
+        top_n: 시드 후보 상한
+        min_trade_value: 최소 거래대금 필터(원)
+        lookback_days: 거래량 급증 룩백 (기본 20)
+        spike_threshold: 급증 배율 (기본 3.0)
+        baseline_days: 비교 기준 기간 (기본 40)
+        enable_trend_template: Minervini Trend Template 사용 여부
+        enable_near_52w_high: 52주 고점 근접 필터 사용 여부
+        high_proximity: 52주 고점 대비 허용 비율 (0.75 = 고점의 75% 이상)
+        enable_rs_filter: KODEX 200 대비 RS 필터 사용 여부
+        rs_period_days: RS 수익률 계산 기간 (기본 63 ≈ 3개월)
+        min_rs_outperformance: 벤치마크 초과수익 하한 (pp)
     """
     today_str = datetime.today().strftime("%Y%m%d")
-    start_str = (datetime.today() - timedelta(days=200)).strftime("%Y%m%d")
+    start_str = (datetime.today() - timedelta(days=365)).strftime("%Y%m%d")
+
+    # 0) RS 필터 활성화 시 벤치마크(KODEX 200) 수익률 1회 계산
+    benchmark_ret = None
+    if enable_rs_filter:
+        bench_df = stock.get_market_ohlcv(start_str, today_str, '069500')
+        if len(bench_df) >= rs_period_days + 1:
+            benchmark_ret = (bench_df['종가'].iloc[-1]
+                             / bench_df['종가'].iloc[-rs_period_days - 1] - 1) * 100
 
     # 1) 넓은 시드 후보 수집
     candidates = _get_kr_candidates(market, top_n)
 
-    # 2) 후보별 OHLCV 조회 → 20일내 거래량 급증 필터 → 전략 적용
+    # 2) 후보별 사전필터 파이프라인
     results = []
-    passed_spike_count = 0
+    funnel = {"거래량급증": 0, "Trend_Template": 0, "52주고점근접": 0, "RS": 0}
     for cand in candidates:
         ticker = cand['code']
         name = cand['name']
@@ -903,7 +1002,28 @@ def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
             )
             if not had_spike:
                 continue
-            passed_spike_count += 1
+            funnel["거래량급증"] += 1
+
+            if enable_trend_template:
+                passed_tt, _tt_conds = _check_trend_template(df, '종가', '고가', '저가')
+                if not passed_tt:
+                    continue
+                funnel["Trend_Template"] += 1
+
+            if enable_near_52w_high:
+                passed_hi, high_ratio = _check_near_52w_high(df, '종가', '고가', high_proximity)
+                if not passed_hi:
+                    continue
+                funnel["52주고점근접"] += 1
+            else:
+                high_ratio = None
+
+            rs_delta = None
+            if enable_rs_filter and benchmark_ret is not None:
+                rs_delta = _compute_rs_delta(df, '종가', benchmark_ret, rs_period_days)
+                if rs_delta is None or rs_delta < min_rs_outperformance:
+                    continue
+                funnel["RS"] += 1
 
             df = _calc_screening_indicators(
                 df, close='종가', high='고가', low='저가', open_='시가', volume='거래량'
@@ -911,6 +1031,10 @@ def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
             hits = _apply_strategies(df, ticker, name, '종가', '거래량')
             for h in hits:
                 h['20일내_최대거래량배율'] = f"{spike_ratio}x"
+                if high_ratio is not None:
+                    h['52주고점대비'] = f"{round(high_ratio * 100, 1)}%"
+                if rs_delta is not None:
+                    h['RS초과수익(pp)'] = rs_delta
             results.extend(hits)
         except Exception:
             continue
@@ -929,9 +1053,14 @@ def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
         "스크리닝일": today_str,
         "대상시장": market.upper(),
         "시드후보수": len(candidates),
-        "거래량급증_통과종목수": passed_spike_count,
+        "필터링_단계별_통과": funnel,
         "필터링결과수": len(results),
         "거래량급증_조건": f"최근 {lookback_days}일 중 이전 {baseline_days}일 평균 대비 {spike_threshold}x 이상",
+        "활성화_사전필터": {
+            "Trend_Template": enable_trend_template,
+            "52주고점근접": f"{enable_near_52w_high} (고점×{high_proximity})",
+            "RS_vs_KODEX200": f"{enable_rs_filter} (초과 ≥{min_rs_outperformance}pp)",
+        },
         "적용전략수": len(SCREENING_STRATEGIES),
         "적용전략": [
             "골든크로스+거래량", "눌림목 매수", "모멘텀 돌파", "거래량 폭발",
@@ -959,32 +1088,55 @@ def screen_us_stocks(symbols: list[str] | None = None,
                      top_n: int = 100,
                      lookback_days: int = 20,
                      spike_threshold: float = 3.0,
-                     baseline_days: int = 40) -> str:
-    """미국 주식에서 '최근 N일 내 거래량이 급증한 적 있는' 종목 중 단기 상승
-    확률이 높은 종목을 필터링합니다.
+                     baseline_days: int = 40,
+                     enable_trend_template: bool = True,
+                     enable_near_52w_high: bool = True,
+                     high_proximity: float = 0.75,
+                     enable_rs_filter: bool = False,
+                     rs_period_days: int = 63,
+                     min_rs_outperformance: float = 0.0) -> str:
+    """미국 주식에서 '최근 N일 내 거래량 급증 + 추세 정합' 종목을 필터링합니다.
 
-    [시드] symbols 미지정 시 Yahoo Finance `most_actives` + `day_gainers`
-           + `small_cap_gainers` 합집합에서 수집 (기존 하드코딩 유니버스 대체)
-    [필터] 각 종목 OHLCV로 `max(최근 lookback일 거래량) / 그 이전 baseline일
-           평균 거래량` >= spike_threshold 판정
+    [시드] symbols 미지정 시 Yahoo `most_actives` + `day_gainers` + `small_cap_gainers`
+    [사전필터] 순차 적용:
+      · 거래량 급증: `max(최근 lookback일) / 이전 baseline일 평균` ≥ `spike_threshold`
+      · Minervini Trend Template (옵션): Stage 2 상승추세 6조건
+      · 52주 고점 근접 (옵션): 현재가 ≥ 52주고점 × `high_proximity`
+      · RS vs SPY (옵션): 3개월 초과수익률 ≥ `min_rs_outperformance` (pp)
     [전략] 10가지 기술적 전략 적용
 
     Args:
         symbols: 스크리닝할 티커 목록. None이면 Yahoo 스크리너에서 시드 수집
-        top_n: 시드 후보 상한 (기본 100). symbols 지정 시 무시됨
-        lookback_days: 거래량 급증 이력을 찾을 최근 거래일 수. 기본 20
-        spike_threshold: 급증 판정 배율 (N배 이상). 기본 3.0
-        baseline_days: 비교 기준이 되는 과거 평균 구간. 기본 40일
+        top_n: 시드 후보 상한
+        lookback_days: 거래량 급증 룩백
+        spike_threshold: 급증 배율
+        baseline_days: 비교 기준 기간
+        enable_trend_template: Minervini Trend Template 사용 여부
+        enable_near_52w_high: 52주 고점 근접 필터 사용 여부
+        high_proximity: 52주 고점 대비 허용 비율 (0.75 = 고점의 75% 이상)
+        enable_rs_filter: SPY 대비 RS 필터 사용 여부
+        rs_period_days: RS 수익률 계산 기간 (기본 63 ≈ 3개월)
+        min_rs_outperformance: 벤치마크 초과수익 하한 (pp)
     """
     # 1) 시드 후보 결정
     target_symbols = symbols if symbols else _get_us_candidates(top_n)
 
     end = datetime.now()
-    start = end - timedelta(days=200)
+    start = end - timedelta(days=365)
     results = []
-    passed_spike_count = 0
+    funnel = {"거래량급증": 0, "Trend_Template": 0, "52주고점근접": 0, "RS": 0}
 
-    # 2) 배치 다운로드 (개별 호출 대비 수~수십 배 빠름)
+    # 2) RS 필터용 벤치마크(SPY) 1회 다운로드
+    benchmark_ret = None
+    if enable_rs_filter:
+        spy = yf.download('SPY', start=start, end=end, progress=False, auto_adjust=True)
+        if isinstance(spy.columns, pd.MultiIndex):
+            spy.columns = spy.columns.get_level_values(0)
+        if len(spy) >= rs_period_days + 1:
+            benchmark_ret = (spy['Close'].iloc[-1]
+                             / spy['Close'].iloc[-rs_period_days - 1] - 1) * 100
+
+    # 3) 배치 다운로드 (개별 호출 대비 수~수십 배 빠름)
     if not target_symbols:
         batch = pd.DataFrame()
     elif len(target_symbols) == 1:
@@ -1012,7 +1164,28 @@ def screen_us_stocks(symbols: list[str] | None = None,
             )
             if not had_spike:
                 continue
-            passed_spike_count += 1
+            funnel["거래량급증"] += 1
+
+            if enable_trend_template:
+                passed_tt, _tt = _check_trend_template(df, 'Close', 'High', 'Low')
+                if not passed_tt:
+                    continue
+                funnel["Trend_Template"] += 1
+
+            if enable_near_52w_high:
+                passed_hi, high_ratio = _check_near_52w_high(df, 'Close', 'High', high_proximity)
+                if not passed_hi:
+                    continue
+                funnel["52주고점근접"] += 1
+            else:
+                high_ratio = None
+
+            rs_delta = None
+            if enable_rs_filter and benchmark_ret is not None:
+                rs_delta = _compute_rs_delta(df, 'Close', benchmark_ret, rs_period_days)
+                if rs_delta is None or rs_delta < min_rs_outperformance:
+                    continue
+                funnel["RS"] += 1
 
             df = _calc_screening_indicators(
                 df, close='Close', high='High', low='Low', open_='Open', volume='Volume'
@@ -1025,7 +1198,7 @@ def screen_us_stocks(symbols: list[str] | None = None,
                 latest = df.iloc[-1]
                 prev = df.iloc[-2]
                 vol_ratio = round(latest['_volume'] / latest['Vol_MA5'], 1) if latest['Vol_MA5'] > 0 else 0
-                results.append({
+                result_entry = {
                     "심볼": symbol,
                     "전략": info['전략'],
                     "점수": info['점수'],
@@ -1035,7 +1208,12 @@ def screen_us_stocks(symbols: list[str] | None = None,
                     "거래량비": f"{vol_ratio}x",
                     "20일내_최대거래량배율": f"{spike_ratio}x",
                     "조건상세": info['조건'],
-                })
+                }
+                if high_ratio is not None:
+                    result_entry['52주고점대비'] = f"{round(high_ratio * 100, 1)}%"
+                if rs_delta is not None:
+                    result_entry['RS초과수익(pp)'] = rs_delta
+                results.append(result_entry)
         except Exception:
             continue
 
@@ -1052,9 +1230,14 @@ def screen_us_stocks(symbols: list[str] | None = None,
     output = {
         "스크리닝일": datetime.today().strftime("%Y%m%d"),
         "시드종목수": len(target_symbols),
-        "거래량급증_통과종목수": passed_spike_count,
+        "필터링_단계별_통과": funnel,
         "필터링결과수": len(results),
         "거래량급증_조건": f"최근 {lookback_days}일 중 이전 {baseline_days}일 평균 대비 {spike_threshold}x 이상",
+        "활성화_사전필터": {
+            "Trend_Template": enable_trend_template,
+            "52주고점근접": f"{enable_near_52w_high} (고점×{high_proximity})",
+            "RS_vs_SPY": f"{enable_rs_filter} (초과 ≥{min_rs_outperformance}pp)",
+        },
         "적용전략수": len(SCREENING_STRATEGIES),
         "적용전략": [
             "골든크로스+거래량", "눌림목 매수", "모멘텀 돌파", "거래량 폭발",
