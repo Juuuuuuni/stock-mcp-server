@@ -934,6 +934,7 @@ def _apply_strategies(df: pd.DataFrame, ticker: str, name: str,
 @mcp.tool()
 def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
                      min_trade_value: int = 500_000_000,
+                     exclude_if_up_pct: float | None = 10.0,
                      lookback_days: int = 20,
                      spike_threshold: float = 3.0,
                      baseline_days: int = 40,
@@ -948,6 +949,7 @@ def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
     [시드] 네이버 거래량상위 + 상승률상위 + 급등 합집합
     [사전필터] 순차 적용:
       · 거래대금: `min_trade_value` 이상
+      · 당일 과열 제외: 오늘 등락률이 `exclude_if_up_pct` 이상이면 제외 (추격 매수 방지)
       · 거래량 급증: `max(최근 lookback일) / 이전 baseline일 평균` ≥ `spike_threshold`
       · Minervini Trend Template (옵션): Stage 2 상승추세 6조건
       · 52주 고점 근접 (옵션): 현재가 ≥ 52주고점 × `high_proximity`
@@ -958,6 +960,7 @@ def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
         market: 'KOSPI' | 'KOSDAQ' | 'ALL'
         top_n: 시드 후보 상한
         min_trade_value: 최소 거래대금 필터(원)
+        exclude_if_up_pct: 오늘 등락률이 이 값(%) 이상이면 제외. None이면 미적용 (기본 10.0)
         lookback_days: 거래량 급증 룩백 (기본 20)
         spike_threshold: 급증 배율 (기본 3.0)
         baseline_days: 비교 기준 기간 (기본 40)
@@ -984,7 +987,7 @@ def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
 
     # 2) 후보별 사전필터 파이프라인
     results = []
-    funnel = {"거래량급증": 0, "Trend_Template": 0, "52주고점근접": 0, "RS": 0}
+    funnel = {"당일과열제외": 0, "거래량급증": 0, "Trend_Template": 0, "52주고점근접": 0, "RS": 0}
     for cand in candidates:
         ticker = cand['code']
         name = cand['name']
@@ -996,6 +999,15 @@ def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
             latest_trade_value = df['종가'].iloc[-1] * df['거래량'].iloc[-1]
             if latest_trade_value < min_trade_value:
                 continue
+
+            if exclude_if_up_pct is not None:
+                today_close = df['종가'].iloc[-1]
+                prev_close = df['종가'].iloc[-2]
+                if prev_close > 0:
+                    today_change_pct = (today_close - prev_close) / prev_close * 100
+                    if today_change_pct >= exclude_if_up_pct:
+                        continue
+            funnel["당일과열제외"] += 1
 
             had_spike, spike_ratio = _had_volume_spike(
                 df, '거래량', lookback_days, baseline_days, spike_threshold
@@ -1086,6 +1098,7 @@ def screen_kr_stocks(market: str = "ALL", top_n: int = 150,
 @mcp.tool()
 def screen_us_stocks(symbols: list[str] | None = None,
                      top_n: int = 100,
+                     exclude_if_up_pct: float | None = 10.0,
                      lookback_days: int = 20,
                      spike_threshold: float = 3.0,
                      baseline_days: int = 40,
@@ -1099,6 +1112,7 @@ def screen_us_stocks(symbols: list[str] | None = None,
 
     [시드] symbols 미지정 시 Yahoo `most_actives` + `day_gainers` + `small_cap_gainers`
     [사전필터] 순차 적용:
+      · 당일 과열 제외: 오늘 등락률이 `exclude_if_up_pct` 이상이면 제외 (추격 매수 방지)
       · 거래량 급증: `max(최근 lookback일) / 이전 baseline일 평균` ≥ `spike_threshold`
       · Minervini Trend Template (옵션): Stage 2 상승추세 6조건
       · 52주 고점 근접 (옵션): 현재가 ≥ 52주고점 × `high_proximity`
@@ -1108,6 +1122,7 @@ def screen_us_stocks(symbols: list[str] | None = None,
     Args:
         symbols: 스크리닝할 티커 목록. None이면 Yahoo 스크리너에서 시드 수집
         top_n: 시드 후보 상한
+        exclude_if_up_pct: 오늘 등락률이 이 값(%) 이상이면 제외. None이면 미적용 (기본 10.0)
         lookback_days: 거래량 급증 룩백
         spike_threshold: 급증 배율
         baseline_days: 비교 기준 기간
@@ -1124,7 +1139,7 @@ def screen_us_stocks(symbols: list[str] | None = None,
     end = datetime.now()
     start = end - timedelta(days=365)
     results = []
-    funnel = {"거래량급증": 0, "Trend_Template": 0, "52주고점근접": 0, "RS": 0}
+    funnel = {"당일과열제외": 0, "거래량급증": 0, "Trend_Template": 0, "52주고점근접": 0, "RS": 0}
 
     # 2) RS 필터용 벤치마크(SPY) 1회 다운로드
     benchmark_ret = None
@@ -1158,6 +1173,15 @@ def screen_us_stocks(symbols: list[str] | None = None,
                 df = batch[symbol].dropna(how='all')
             if df.empty or len(df) < lookback_days + baseline_days:
                 continue
+
+            if exclude_if_up_pct is not None:
+                today_close = df['Close'].iloc[-1]
+                prev_close = df['Close'].iloc[-2]
+                if prev_close > 0:
+                    today_change_pct = (today_close - prev_close) / prev_close * 100
+                    if today_change_pct >= exclude_if_up_pct:
+                        continue
+            funnel["당일과열제외"] += 1
 
             had_spike, spike_ratio = _had_volume_spike(
                 df, 'Volume', lookback_days, baseline_days, spike_threshold
