@@ -7,6 +7,8 @@ import numpy as np
 import ta
 import json
 import yfinance as yf
+import requests
+from bs4 import BeautifulSoup
 
 
 mcp = FastMCP("Stock Analyzer")
@@ -359,33 +361,109 @@ SCREENING_STRATEGIES = [
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+def _fetch_naver_volume_top(market: str, max_pages: int) -> list[dict]:
+    """네이버 금융 거래량 상위 페이지에서 종목 리스트를 수집합니다.
+
+    Args:
+        market: 'KOSPI' 또는 'KOSDAQ'
+        max_pages: 조회할 페이지 수 (페이지당 약 40종목)
+
+    Returns:
+        [{"code": "005930", "name": "삼성전자"}, ...]
+    """
+    sosok = "0" if market.upper() == "KOSPI" else "1"
+    items = []
+    seen = set()
+    for page in range(1, max_pages + 1):
+        url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}&page={page}"
+        try:
+            r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+            r.encoding = 'euc-kr'
+        except requests.RequestException:
+            break
+        soup = BeautifulSoup(r.text, 'lxml')
+        for tr in soup.select('table.type_2 tr'):
+            a = tr.select_one('a.tltle')
+            if not a:
+                continue
+            href = a.get('href', '')
+            if 'code=' not in href:
+                continue
+            code = href.split('code=')[-1]
+            if code in seen:
+                continue
+            seen.add(code)
+            items.append({"code": code, "name": a.text.strip()})
+    return items
+
+
+def _apply_strategies(df: pd.DataFrame, ticker: str, name: str,
+                      close_col: str, volume_col: str) -> list[dict]:
+    """종목 하나에 4가지 전략을 적용해 통과한 결과만 반환합니다."""
+    hits = []
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    vol_ma5 = latest['Vol_MA5']
+    vol_ratio = round(latest[volume_col] / vol_ma5, 1) if vol_ma5 > 0 else 0
+    change_pct = round((latest[close_col] - prev[close_col]) / prev[close_col] * 100, 2)
+
+    for strat_func in SCREENING_STRATEGIES:
+        passed, info = strat_func(df)
+        if not passed:
+            continue
+        hits.append({
+            "종목코드": ticker,
+            "종목명": name,
+            "전략": info['전략'],
+            "점수": info['점수'],
+            "현재가": int(latest[close_col]),
+            "등락률": f"{change_pct:+}%",
+            "RSI": round(latest['RSI'], 1) if pd.notna(latest['RSI']) else None,
+            "거래량비": f"{vol_ratio}x",
+            "조건상세": info['조건'],
+        })
+    return hits
+
+
 @mcp.tool()
-def screen_kr_stocks(market: str = "ALL", min_trade_value: int = 100_000_000) -> str:
-    """한국 주식(코스피/코스닥)에서 단기 상승 확률이 높은 종목을 기술적 지표로 필터링합니다.
-    4가지 전략(골든크로스+거래량, 눌림목 매수, 모멘텀 돌파, 거래량 폭발)을 복합 적용합니다.
+def screen_kr_stocks(market: str = "ALL", top_n: int = 80,
+                     min_trade_value: int = 500_000_000) -> str:
+    """한국 주식의 거래량 상위 종목 중 단기 상승 확률이 높은 종목을 필터링합니다.
+
+    네이버 금융 '거래량 상위' 페이지에서 대상을 수집한 뒤,
+    각 종목의 200일 OHLCV로 4가지 전략(골든크로스+거래량, 눌림목 매수,
+    모멘텀 돌파, 거래량 폭발)을 적용합니다.
+    전체 시장 스캔(~2700종목) 대신 '거래량이 터진 종목'만 분석하므로 훨씬 빠릅니다.
 
     Args:
         market: 시장 선택 ('KOSPI', 'KOSDAQ', 'ALL'). 기본 'ALL'
-        min_trade_value: 최소 거래대금 필터 (원). 기본 1억원. 유동성 낮은 종목 제외용
+        top_n: 거래량 상위 몇 종목을 분석할지 (기본 80, 최대 200 권장)
+        min_trade_value: 최소 거래대금 필터 (원). 기본 5억원
     """
+    # 1) 거래량 상위 후보 수집 (네이버)
+    markets = ["KOSPI", "KOSDAQ"] if market.upper() == "ALL" else [market.upper()]
+    per_market_quota = max(1, top_n // len(markets))
+    pages_per_market = max(1, -(-per_market_quota // 40))  # ceil(quota / 40)
+
+    candidates = []
+    for m in markets:
+        bucket = _fetch_naver_volume_top(m, pages_per_market)[:per_market_quota]
+        candidates.extend(bucket)
+    candidates = candidates[:top_n]
+
+    # 2) 후보별 심층 분석 (pykrx)
     today_str = datetime.today().strftime("%Y%m%d")
     start_str = (datetime.today() - timedelta(days=200)).strftime("%Y%m%d")
 
-    if market.upper() == "ALL":
-        tickers = stock.get_market_ticker_list(today_str, market="KOSPI") + \
-                  stock.get_market_ticker_list(today_str, market="KOSDAQ")
-    else:
-        tickers = stock.get_market_ticker_list(today_str, market=market.upper())
-
     results = []
-
-    for ticker in tickers:
+    for cand in candidates:
+        ticker = cand['code']
+        name = cand['name']
         try:
             df = stock.get_market_ohlcv(start_str, today_str, ticker)
             if len(df) < 60:
                 continue
 
-            # 거래대금 필터
             latest_trade_value = df['종가'].iloc[-1] * df['거래량'].iloc[-1]
             if latest_trade_value < min_trade_value:
                 continue
@@ -393,27 +471,7 @@ def screen_kr_stocks(market: str = "ALL", min_trade_value: int = 100_000_000) ->
             df = _calc_screening_indicators(
                 df, close='종가', high='고가', low='저가', open_='시가', volume='거래량'
             )
-
-            name = stock.get_market_ticker_name(ticker)
-
-            for strat_func in SCREENING_STRATEGIES:
-                passed, info = strat_func(df)
-                if passed:
-                    latest = df.iloc[-1]
-                    prev = df.iloc[-2]
-                    vol_ratio = round(latest['거래량'] / latest['Vol_MA5'], 1) if latest['Vol_MA5'] > 0 else 0
-
-                    results.append({
-                        "종목코드": ticker,
-                        "종목명": name,
-                        "전략": info['전략'],
-                        "점수": info['점수'],
-                        "현재가": int(latest['종가']),
-                        "등락률": f"{round((latest['종가'] - prev['종가']) / prev['종가'] * 100, 2):+}%",
-                        "RSI": round(latest['RSI'], 1) if pd.notna(latest['RSI']) else None,
-                        "거래량비": f"{vol_ratio}x",
-                        "조건상세": info['조건'],
-                    })
+            results.extend(_apply_strategies(df, ticker, name, '종가', '거래량'))
         except Exception:
             continue
 
@@ -431,7 +489,7 @@ def screen_kr_stocks(market: str = "ALL", min_trade_value: int = 100_000_000) ->
     output = {
         "스크리닝일": today_str,
         "대상시장": market.upper(),
-        "스캔종목수": len(tickers),
+        "후보종목수": len(candidates),
         "필터링결과수": len(results),
         "복수전략_충족종목": [
             {"종목코드": t, "종목명": next(r['종목명'] for r in results if r['종목코드'] == t),
