@@ -10,7 +10,7 @@ dependencies = [
     "mplfinance>=0.12.10b0",
     "pandas>=3.0.2",
     "pykrx>=1.0.51",
-    "setuptools>=82.0.1",
+    "setuptools>=80,<81",
     "ta>=0.11.0",
     "yfinance>=1.2.1",
 ]

@@ -26,6 +26,8 @@ def get_stock_analysis(ticker: str, days: int = 120) -> str:
     df = stock.get_market_ohlcv(start, end, ticker)
     if df.empty:
         return f"종목코드 {ticker}에 대한 데이터를 찾을 수 없습니다."
+    if len(df) < 2:
+        return f"종목코드 {ticker}의 데이터가 부족합니다 (거래일 {len(df)}일). 분석 기간을 늘려주세요."
 
     # 종목명 가져오기
     name = stock.get_market_ticker_name(ticker)
@@ -134,6 +136,8 @@ def get_us_stock_analysis(symbol: str, days: int = 120) -> str:
 
     if df.empty:
         return f"'{symbol}'에 대한 데이터를 찾을 수 없습니다."
+    if len(df) < 2:
+        return f"'{symbol}'의 데이터가 부족합니다 (거래일 {len(df)}일). 분석 기간을 늘려주세요."
 
     info = tk.info
     name = info.get("shortName", symbol)
